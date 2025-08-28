@@ -22,37 +22,16 @@ class PIIDetectorRedactor:
             'device_ip': ['device_id', 'ip_address']
         }
 
-        # Common non-PII patterns to avoid false positives
-        self.non_pii_patterns = {
-            'transaction_id': re.compile(r'\b(TXN|ORD|INV)-?\d+\b', re.IGNORECASE),
-            'product_id': re.compile(r'\b(PROD|ITEM)-?\d+\b', re.IGNORECASE),
-            'order_id': re.compile(r'\b(ORD|BK)-?\d+\b', re.IGNORECASE)
-        }
-
-    def is_likely_non_pii(self, value: str) -> bool:
-        """Check if value matches common non-PII patterns"""
-        if not isinstance(value, str):
-            return False
-            
-        for pattern in self.non_pii_patterns.values():
-            if pattern.search(value):
-                return True
-        return False
-
     def detect_standalone_pii(self, value: str) -> List[str]:
         """Detect standalone PII in a string value"""
         detected = []
         
-        if not isinstance(value, str) or self.is_likely_non_pii(value):
+        if not isinstance(value, str):
             return detected
             
         # Check for phone numbers
-        phone_matches = self.patterns['phone'].findall(value)
-        if phone_matches:
-            for match in phone_matches:
-                # Additional validation to avoid false positives
-                if not match.startswith(('000', '999')):  # Avoid test numbers
-                    detected.append('phone')
+        if self.patterns['phone'].search(value):
+            detected.append('phone')
             
         # Check for Aadhar numbers
         if self.patterns['aadhar'].search(value):
@@ -74,9 +53,12 @@ class PIIDetectorRedactor:
         
         for category, keys in self.combinatorial_indicators.items():
             for key in keys:
-                if (key in record and record[key] and 
-                    str(record[key]).strip() and not self.is_likely_non_pii(str(record[key]))):
-                    found_categories.add(category)
+                if key in record and record[key] and str(record[key]).strip():
+                    # Additional checks to avoid false positives
+                    if category == 'name' and len(str(record[key]).split()) >= 2:
+                        found_categories.add(category)
+                    elif category != 'name':
+                        found_categories.add(category)
                     break
         
         # Need at least 2 combinatorial PII categories to be considered PII
@@ -90,7 +72,7 @@ class PIIDetectorRedactor:
         if pii_type == 'phone':
             return re.sub(r'(\d{2})\d{6}(\d{2})', r'\1XXXXXX\2', value)
         elif pii_type == 'aadhar':
-            return re.sub(r'(\d{4})\s?\d{4}\s?(\d{4})', r'\1 XXXX XXXX \2', value)
+            return re.sub(r'(\d{4})\s?\d{4}\s?(\d{4})', r'\1XXXX\2', value)
         elif pii_type == 'passport':
             return re.sub(r'([A-Z]{1,2})(\d{6,7})', r'\1XXXXXX', value)
         elif pii_type == 'upi':
@@ -137,13 +119,28 @@ class PIIDetectorRedactor:
                             redacted_record[key] = self.redact_value(redacted_record[key], 'name')
                         elif category == 'email':
                             redacted_record[key] = self.redact_value(redacted_record[key], 'email')
-                        else:
-                            redacted_record[key] = self.redact_value(redacted_record[key], 'generic')
+                        elif category == 'address':
+                            redacted_record[key] = '[REDACTED_ADDRESS]'
+                        elif category == 'device_ip':
+                            redacted_record[key] = '[REDACTED_DEVICE_INFO]'
         
         # Determine if record contains any PII
         has_pii = has_standalone_pii or has_combinatorial_pii
         
         return redacted_record, has_pii
+
+    def fix_json_string(self, json_str: str) -> str:
+        """Attempt to fix common JSON formatting issues"""
+        # Remove any trailing commas before closing braces/brackets
+        json_str = re.sub(r',\s*([}\]])', r'\1', json_str)
+        
+        # Fix missing quotes around keys
+        json_str = re.sub(r'([{,])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', json_str)
+        
+        # Fix single quotes to double quotes
+        json_str = json_str.replace("'", '"')
+        
+        return json_str
 
     def process_csv(self, input_file: str, output_file: str):
         """Process the entire CSV file"""
@@ -151,6 +148,11 @@ class PIIDetectorRedactor:
              open(output_file, 'w', newline='', encoding='utf-8') as outfile:
             
             reader = csv.DictReader(infile)
+            
+            # Check if the CSV has the expected columns
+            if 'record_id' not in reader.fieldnames or 'data_json' not in reader.fieldnames:
+                raise ValueError("CSV must contain 'record_id' and 'data_json' columns")
+            
             fieldnames = ['record_id', 'redacted_data_json', 'is_pii']
             writer = csv.DictWriter(outfile, fieldnames=fieldnames)
             writer.writeheader()
@@ -158,7 +160,7 @@ class PIIDetectorRedactor:
             for row in reader:
                 try:
                     # Parse the JSON data
-                    data_json = json.loads(row['Data_json'])
+                    data_json = json.loads(row['data_json'])
                     record_id = row['record_id']
                     
                     # Process the record
@@ -171,18 +173,37 @@ class PIIDetectorRedactor:
                         'is_pii': is_pii
                     })
                     
-                except json.JSONDecodeError:
-                    # Handle invalid JSON
-                    writer.writerow({
-                        'record_id': row['record_id'],
-                        'redacted_data_json': row['Data_json'],
-                        'is_pii': False
-                    })
+                except json.JSONDecodeError as e:
+                    print(f"JSON decode error in record {row.get('record_id', 'unknown')}. Attempting to fix...")
+                    try:
+                        # Try to fix the JSON string
+                        fixed_json = self.fix_json_string(row['data_json'])
+                        data_json = json.loads(fixed_json)
+                        record_id = row['record_id']
+                        
+                        # Process the record
+                        redacted_data, is_pii = self.process_record(data_json)
+                        
+                        # Write the result
+                        writer.writerow({
+                            'record_id': record_id,
+                            'redacted_data_json': json.dumps(redacted_data),
+                            'is_pii': is_pii
+                        })
+                        print(f"Successfully fixed JSON for record {record_id}")
+                        
+                    except json.JSONDecodeError:
+                        print(f"Could not fix JSON for record {row.get('record_id', 'unknown')}. Using original string.")
+                        writer.writerow({
+                            'record_id': row.get('record_id', 'unknown'),
+                            'redacted_data_json': row.get('data_json', '{}'),
+                            'is_pii': False
+                        })
                 except Exception as e:
                     print(f"Error processing record {row.get('record_id', 'unknown')}: {e}")
                     writer.writerow({
                         'record_id': row.get('record_id', 'unknown'),
-                        'redacted_data_json': row.get('Data_json', '{}'),
+                        'redacted_data_json': row.get('data_json', '{}'),
                         'is_pii': False
                     })
 
